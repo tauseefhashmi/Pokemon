@@ -1,13 +1,7 @@
-
-
-#```python
 #!/usr/bin/env python3
 """
-pokepipeline.py
-Fetches pokemon data from PokeAPI, transforms and loads into SQLite.
-Usage:
-    python pokepipeline.py --start-id 1 --end-id 20
-    python pokepipeline.py --ids 1 4 7 25
+PokéPipeline: Fetch Pokémon data from PokeAPI and store in local SQLite database.
+Includes Pokémon info, types, abilities, stats, and evolution chain.
 """
 
 import argparse
@@ -16,12 +10,20 @@ import time
 import requests
 from typing import List, Dict, Any, Optional, Tuple
 
-BASE = "https://pokeapi.co/api/v2"
+# -----------------------
+# Constants
+# -----------------------
+BASE = "https://pokeapi.co/api/v2"  # Base URL for PokeAPI
+DB_FILE = "pokemon.db"              # Default SQLite database file
 
 # -----------------------
-# Utilities: HTTP fetch with retries
+# Utility functions
 # -----------------------
 def fetch_json(url: str, max_retries: int = 3, backoff: float = 0.5) -> Optional[Dict[str, Any]]:
+    """
+    Fetch JSON data from a given URL with retry and exponential backoff.
+    Returns the JSON dict on success, None on failure or 404.
+    """
     for attempt in range(1, max_retries + 1):
         try:
             r = requests.get(url, timeout=10)
@@ -30,15 +32,15 @@ def fetch_json(url: str, max_retries: int = 3, backoff: float = 0.5) -> Optional
             elif r.status_code == 404:
                 return None
             else:
-                print(f"Warning: {url} returned status {r.status_code}. Attempt {attempt}/{max_retries}")
+                print(f"[WARN] {url} returned status {r.status_code} (Attempt {attempt}/{max_retries})")
         except requests.RequestException as e:
-            print(f"Request exception for {url}: {e}. Attempt {attempt}/{max_retries}")
+            print(f"[ERROR] Request exception for {url}: {e} (Attempt {attempt}/{max_retries})")
         time.sleep(backoff * attempt)
-    print(f"Failed to fetch {url} after {max_retries} attempts.")
+    print(f"[FAIL] Could not fetch {url} after {max_retries} attempts.")
     return None
 
 # -----------------------
-# DB schema and helpers
+# Database schema
 # -----------------------
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -58,11 +60,6 @@ CREATE TABLE IF NOT EXISTS types (
     name TEXT UNIQUE NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS abilities (
-    id INTEGER PRIMARY KEY,
-    name TEXT UNIQUE NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS pokemon_types (
     pokemon_id INTEGER,
     type_id INTEGER,
@@ -72,11 +69,16 @@ CREATE TABLE IF NOT EXISTS pokemon_types (
     FOREIGN KEY (type_id) REFERENCES types(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS abilities (
+    id INTEGER PRIMARY KEY,
+    name TEXT UNIQUE NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS pokemon_abilities (
     pokemon_id INTEGER,
     ability_id INTEGER,
     slot INTEGER,
-    is_hidden INTEGER,
+    is_hidden BOOLEAN,
     PRIMARY KEY (pokemon_id, ability_id),
     FOREIGN KEY (pokemon_id) REFERENCES pokemon(id) ON DELETE CASCADE,
     FOREIGN KEY (ability_id) REFERENCES abilities(id) ON DELETE CASCADE
@@ -84,30 +86,37 @@ CREATE TABLE IF NOT EXISTS pokemon_abilities (
 
 CREATE TABLE IF NOT EXISTS stats (
     pokemon_id INTEGER,
-    stat_name TEXT,
+    name TEXT,
     base_stat INTEGER,
     effort INTEGER,
-    PRIMARY KEY (pokemon_id, stat_name),
+    PRIMARY KEY (pokemon_id, name),
     FOREIGN KEY (pokemon_id) REFERENCES pokemon(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS evolutions (
-    chain_id INTEGER,
-    from_species TEXT,
-    to_species TEXT,
-    PRIMARY KEY (chain_id, from_species, to_species)
+    from_pokemon_id INTEGER,
+    to_pokemon_id INTEGER,
+    PRIMARY KEY (from_pokemon_id, to_pokemon_id),
+    FOREIGN KEY (from_pokemon_id) REFERENCES pokemon(id),
+    FOREIGN KEY (to_pokemon_id) REFERENCES pokemon(id)
 );
 """
 
 def init_db(conn: sqlite3.Connection):
+    """
+    Initialize the SQLite database and create tables if they do not exist.
+    """
     conn.executescript(SCHEMA)
     conn.commit()
+    print(f"[INFO] Database initialized and tables created (if not exist).")
 
 # -----------------------
 # Transform helpers
 # -----------------------
 def extract_pokemon_basic(raw: Dict[str, Any]) -> Dict[str, Any]:
-    # raw is /pokemon/{id}
+    """
+    Extract basic Pokémon info from raw JSON.
+    """
     return {
         "id": raw["id"],
         "name": raw["name"],
@@ -118,12 +127,14 @@ def extract_pokemon_basic(raw: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 def extract_types(raw: Dict[str, Any]) -> List[Tuple[int, str, int]]:
-    # returns list of (type_id (we use id parsed from url), type_name, slot)
+    """
+    Extract Pokémon types from raw JSON.
+    Returns list of tuples: (type_id, type_name, slot)
+    """
     res = []
     for t in raw.get("types", []):
         type_url = t["type"]["url"]
         type_name = t["type"]["name"]
-        # parse id from url e.g. https://pokeapi.co/api/v2/type/3/
         try:
             type_id = int(type_url.rstrip("/").split("/")[-1])
         except:
@@ -132,6 +143,10 @@ def extract_types(raw: Dict[str, Any]) -> List[Tuple[int, str, int]]:
     return res
 
 def extract_abilities(raw: Dict[str, Any]) -> List[Tuple[int, str, int, bool]]:
+    """
+    Extract Pokémon abilities from raw JSON.
+    Returns list of tuples: (ability_id, ability_name, slot, is_hidden)
+    """
     res = []
     for a in raw.get("abilities", []):
         ability_url = a["ability"]["url"]
@@ -144,44 +159,46 @@ def extract_abilities(raw: Dict[str, Any]) -> List[Tuple[int, str, int, bool]]:
     return res
 
 def extract_stats(raw: Dict[str, Any]) -> List[Tuple[str, int, int]]:
+    """
+    Extract Pokémon stats from raw JSON.
+    Returns list of tuples: (stat_name, base_stat, effort)
+    """
     res = []
     for s in raw.get("stats", []):
-        stat_name = s["stat"]["name"]
-        res.append((stat_name, s.get("base_stat", 0), s.get("effort", 0)))
+        res.append((s["stat"]["name"], s.get("base_stat", 0), s.get("effort", 0)))
     return res
 
-# -----------------------
-# Evolution chain flattening
-# -----------------------
-def flatten_evolution_chain(chain: Dict[str, Any]) -> List[Tuple[str, str]]:
+def extract_evolution_chain(species_url: str) -> Optional[int]:
     """
-    Given the 'chain' node from evolution-chain endpoint, returns list of edges (from_species, to_species)
-    Handles multiple evolves_to entries by flattening.
+    Extract evolution chain ID from species URL.
     """
-    edges = []
-
-    def walk(node):
-        from_species = node["species"]["name"]
-        for child in node.get("evolves_to", []):
-            to_species = child["species"]["name"]
-            edges.append((from_species, to_species))
-            walk(child)
-
-    walk(chain)
-    return edges
+    species_data = fetch_json(species_url)
+    if species_data and species_data.get("evolution_chain"):
+        chain_url = species_data["evolution_chain"]["url"]
+        try:
+            return int(chain_url.rstrip("/").split("/")[-1])
+        except:
+            return None
+    return None
 
 # -----------------------
-# Insert helpers
+# Database insert helpers
 # -----------------------
 def upsert_pokemon(conn: sqlite3.Connection, p: Dict[str, Any], evolution_chain_id: Optional[int]):
+    """
+    Insert or replace Pokémon basic info into the 'pokemon' table.
+    """
     conn.execute("""
         INSERT OR REPLACE INTO pokemon (id, name, height, weight, base_experience, species_url, evolution_chain_id)
         VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (p["id"], p["name"], p["height"], p["weight"], p["base_experience"], p["species_url"], evolution_chain_id))
 
 def upsert_type(conn: sqlite3.Connection, type_id: Optional[int], type_name: str) -> int:
+    """
+    Insert type into 'types' table or get existing ID.
+    Returns the type_id used.
+    """
     if type_id is None:
-        # try insert or get id by name
         cur = conn.execute("SELECT id FROM types WHERE name = ?", (type_name,))
         row = cur.fetchone()
         if row:
@@ -192,7 +209,20 @@ def upsert_type(conn: sqlite3.Connection, type_id: Optional[int], type_name: str
         conn.execute("INSERT OR IGNORE INTO types (id, name) VALUES (?, ?)", (type_id, type_name))
         return type_id
 
+def insert_pokemon_type(conn: sqlite3.Connection, pokemon_id: int, type_id: int, slot: int):
+    """
+    Link Pokémon with type in 'pokemon_types' table.
+    """
+    conn.execute("""
+        INSERT OR REPLACE INTO pokemon_types (pokemon_id, type_id, slot)
+        VALUES (?, ?, ?)
+    """, (pokemon_id, type_id, slot))
+
 def upsert_ability(conn: sqlite3.Connection, ability_id: Optional[int], ability_name: str) -> int:
+    """
+    Insert ability into 'abilities' table or get existing ID.
+    Returns the ability_id used.
+    """
     if ability_id is None:
         cur = conn.execute("SELECT id FROM abilities WHERE name = ?", (ability_name,))
         row = cur.fetchone()
@@ -204,117 +234,104 @@ def upsert_ability(conn: sqlite3.Connection, ability_id: Optional[int], ability_
         conn.execute("INSERT OR IGNORE INTO abilities (id, name) VALUES (?, ?)", (ability_id, ability_name))
         return ability_id
 
-def insert_pokemon_type(conn: sqlite3.Connection, pokemon_id: int, type_id: int, slot: int):
-    conn.execute("""
-        INSERT OR REPLACE INTO pokemon_types (pokemon_id, type_id, slot)
-        VALUES (?, ?, ?)
-    """, (pokemon_id, type_id, slot))
-
 def insert_pokemon_ability(conn: sqlite3.Connection, pokemon_id: int, ability_id: int, slot: int, is_hidden: bool):
+    """
+    Link Pokémon with ability in 'pokemon_abilities' table.
+    """
     conn.execute("""
         INSERT OR REPLACE INTO pokemon_abilities (pokemon_id, ability_id, slot, is_hidden)
         VALUES (?, ?, ?, ?)
-    """, (pokemon_id, ability_id, slot, int(is_hidden)))
+    """, (pokemon_id, ability_id, slot, is_hidden))
 
-def insert_stat(conn: sqlite3.Connection, pokemon_id: int, stat_name: str, base_stat: int, effort: int):
+def insert_stat(conn: sqlite3.Connection, pokemon_id: int, name: str, base_stat: int, effort: int):
+    """
+    Insert a stat for a Pokémon into 'stats' table.
+    """
     conn.execute("""
-        INSERT OR REPLACE INTO stats (pokemon_id, stat_name, base_stat, effort)
+        INSERT OR REPLACE INTO stats (pokemon_id, name, base_stat, effort)
         VALUES (?, ?, ?, ?)
-    """, (pokemon_id, stat_name, base_stat, effort))
-
-def insert_evolutions(conn: sqlite3.Connection, chain_id: int, edges: List[Tuple[str, str]]):
-    for from_sp, to_sp in edges:
-        conn.execute("""
-            INSERT OR REPLACE INTO evolutions (chain_id, from_species, to_species)
-            VALUES (?, ?, ?)
-        """, (chain_id, from_sp, to_sp))
+    """, (pokemon_id, name, base_stat, effort))
 
 # -----------------------
-# Main pipeline logic
+# Main pipeline
 # -----------------------
 def fetch_and_store_pokemon(conn: sqlite3.Connection, pokemon_ids: List[int]):
+    """
+    Fetch Pokémon data for a list of IDs and store in SQLite database.
+    """
     for pid in pokemon_ids:
-        print(f"Fetching pokemon id={pid} ...")
-        p_raw = fetch_json(f"{BASE}/pokemon/{pid}")
-        if not p_raw:
-            print(f"Skipping id {pid} (no data).")
+        print(f"[INFO] Fetching Pokémon ID {pid}...")
+        raw = fetch_json(f"{BASE}/pokemon/{pid}")
+        if not raw:
+            print(f"[WARN] Skipping ID {pid}.")
             continue
 
-        basic = extract_pokemon_basic(p_raw)
-        types = extract_types(p_raw)
-        abilities = extract_abilities(p_raw)
-        stats = extract_stats(p_raw)
+        # Extract data
+        basic = extract_pokemon_basic(raw)
+        types = extract_types(raw)
+        abilities = extract_abilities(raw)
+        stats = extract_stats(raw)
+        evolution_chain_id = extract_evolution_chain(basic["species_url"]) if basic["species_url"] else None
 
-        # Try to fetch evolution chain id via species endpoint
-        evolution_chain_id = None
-        if basic["species_url"]:
-            species = fetch_json(basic["species_url"])
-            if species and species.get("evolution_chain") and species["evolution_chain"].get("url"):
-                ec_url = species["evolution_chain"]["url"]
-                # parse integer id at end of ec_url
-                try:
-                    evolution_chain_id = int(ec_url.rstrip("/").split("/")[-1])
-                except:
-                    evolution_chain_id = None
-
-                # fetch the chain and insert evolutions (best effort)
-                chain_json = fetch_json(ec_url)
-                if chain_json and chain_json.get("chain"):
-                    edges = flatten_evolution_chain(chain_json["chain"])
-                    if edges:
-                        insert_evolutions(conn, evolution_chain_id, edges)
-                        print(f"Inserted {len(edges)} evolution edges for chain {evolution_chain_id}")
-
-        # Upsert pokemon row
+        # Insert Pokémon
         upsert_pokemon(conn, basic, evolution_chain_id)
 
-        # Types
+        # Insert types
         for t_id, t_name, slot in types:
             real_type_id = upsert_type(conn, t_id, t_name)
             insert_pokemon_type(conn, basic["id"], real_type_id, slot)
 
-        # Abilities
+        # Insert abilities
         for a_id, a_name, slot, is_hidden in abilities:
             real_ability_id = upsert_ability(conn, a_id, a_name)
             insert_pokemon_ability(conn, basic["id"], real_ability_id, slot, is_hidden)
 
-        # Stats
+        # Insert stats
         for stat_name, base_stat, effort in stats:
             insert_stat(conn, basic["id"], stat_name, base_stat, effort)
 
         conn.commit()
-        print(f"Stored pokemon {basic['name']} (id={basic['id']})")
+        print(f"[SUCCESS] Stored Pokémon: {basic['name']} (ID {basic['id']})")
 
 # -----------------------
-# CLI
+# CLI argument parsing
 # -----------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="PokéPipeline: fetch and store Pokemon data")
-    group = p.add_mutually_exclusive_group(required=False)
-    group.add_argument("--ids", nargs="+", type=int, help="List of pokemon IDs to fetch")
+    """
+    Parse command-line arguments for the pipeline.
+    """
+    p = argparse.ArgumentParser(description="PokéPipeline: Fetch and store Pokémon data")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--ids", nargs="+", type=int, help="Specific Pokémon IDs")
     group.add_argument("--start-id", type=int, help="Start ID (inclusive)")
-    p.add_argument("--end-id", type=int, help="End ID (inclusive) when using --start-id")
-    p.add_argument("--db", default="pokepipeline.db", help="Path to SQLite DB")
+    p.add_argument("--end-id", type=int, help="End ID (inclusive) for --start-id")
+    p.add_argument("--db", default=DB_FILE, help="SQLite database file path")
     return p.parse_args()
 
 def main():
+    """
+    Main function: Determine Pokémon IDs, connect to DB, fetch data, and store.
+    """
     args = parse_args()
+
+    # Determine IDs to fetch
     if args.ids:
         pokemon_ids = args.ids
     elif args.start_id:
         end = args.end_id if args.end_id else args.start_id
         pokemon_ids = list(range(args.start_id, end + 1))
     else:
-        pokemon_ids = list(range(1, 21))  # default 1..20
+        pokemon_ids = list(range(1, 21))  # default first 20 Pokémon
 
+    # Connect to DB
     conn = sqlite3.connect(args.db)
     init_db(conn)
+
     try:
         fetch_and_store_pokemon(conn, pokemon_ids)
     finally:
         conn.close()
-    print("Done.")
+        print(f"[INFO] Database connection closed. Data stored in {args.db}")
 
 if __name__ == "__main__":
     main()
-
